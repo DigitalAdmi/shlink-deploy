@@ -1,0 +1,121 @@
+# Shlink (acortador de enlaces) — KVM4, desplegado por Dokploy (Compose).
+# Repo de despliegue: DigitalAdmi/shlink-deploy. Las imágenes se CONSTRUYEN
+# desde los forks de DigitalAdmi en una versión fija (tag), no se bajan de
+# Docker Hub. Para actualizar: sincronizar el fork, cambiar el tag aquí y
+# Deploy en Dokploy.
+#
+#   https://shortdi.link/<código>  -> enlaces cortos (Shlink)
+#   https://app.shortdi.link       -> panel (shlink-web-client) con basicAuth
+#
+# Secretos: en la pestaña Environment de Dokploy (ver .env.example), nunca
+# en este repo.
+
+services:
+  shlink:
+    build:
+      context: https://github.com/DigitalAdmi/shlink.git#v5.1.8
+      args:
+        SHLINK_VERSION: "5.1.8"
+    image: shlink-local:5.1.8
+    restart: unless-stopped
+    environment:
+      DEFAULT_DOMAIN: shortdi.link
+      IS_HTTPS_ENABLED: "true"
+      DB_DRIVER: postgres
+      DB_HOST: db
+      DB_NAME: shlink
+      DB_USER: shlink
+      DB_PASSWORD: ${DB_PASSWORD}
+      INITIAL_API_KEY: ${API_KEY}
+      GEOLITE_LICENSE_KEY: ${GEOLITE_LICENSE_KEY}
+      TIMEZONE: America/Bogota
+      # Un solo proxy (Traefik) delante: la IP real del visitante viene en X-Forwarded-For
+      TRUSTED_PROXIES: "1"
+      # Medido en KVM1 con 2/2: ~130 MB de RAM
+      WEB_WORKER_NUM: "2"
+      TASK_WORKER_NUM: "2"
+      # A dónde mandar shortdi.link/ (sin código) y códigos inexistentes.
+      # Vacío = 404.
+      DEFAULT_BASE_URL_REDIRECT: ${BASE_URL_REDIRECT:-}
+      DEFAULT_INVALID_SHORT_URL_REDIRECT: ${INVALID_URL_REDIRECT:-}
+    # Base GeoLite2 (~51 MB), cache y locks: persiste para no re-descargar
+    # GeoLite en cada reinicio (MaxMind limita las descargas diarias)
+    volumes:
+      - shlink-data:/etc/shlink/data
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [default, dokploy-network]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+      - traefik.http.routers.shlink-http.rule=Host(`shortdi.link`) || Host(`www.shortdi.link`)
+      - traefik.http.routers.shlink-http.entrypoints=web
+      - traefik.http.routers.shlink-http.middlewares=redirect-to-https@file
+      - traefik.http.routers.shlink.rule=Host(`shortdi.link`)
+      - traefik.http.routers.shlink.entrypoints=websecure
+      - traefik.http.routers.shlink.tls.certresolver=letsencrypt
+      - traefik.http.routers.shlink.service=shlink
+      - traefik.http.services.shlink.loadbalancer.server.port=8080
+      # www.shortdi.link/<código> -> shortdi.link/<código> (CNAME www de la zona)
+      - traefik.http.middlewares.shlink-www.redirectregex.regex=^https://www\.shortdi\.link/(.*)
+      - traefik.http.middlewares.shlink-www.redirectregex.replacement=https://shortdi.link/$${1}
+      - traefik.http.middlewares.shlink-www.redirectregex.permanent=true
+      - traefik.http.routers.shlink-www.rule=Host(`www.shortdi.link`)
+      - traefik.http.routers.shlink-www.entrypoints=websecure
+      - traefik.http.routers.shlink-www.tls.certresolver=letsencrypt
+      - traefik.http.routers.shlink-www.middlewares=shlink-www
+      - traefik.http.routers.shlink-www.service=shlink
+
+  # Panel: HTML/JS estático. Va preconfigurado con el servidor y la API key
+  # (servers.json), por eso SIEMPRE detrás de basicAuth.
+  web:
+    build:
+      context: https://github.com/DigitalAdmi/shlink-web-client.git#v4.9.0
+      args:
+        VERSION: "4.9.0"
+    image: shlink-web-client-local:4.9.0
+    restart: unless-stopped
+    environment:
+      SHLINK_SERVER_NAME: shortdi.link
+      SHLINK_SERVER_URL: https://shortdi.link
+      SHLINK_SERVER_API_KEY: ${API_KEY}
+    networks: [dokploy-network]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+      # APP_BASIC_AUTH = salida de `htpasswd -nbB usuario clave` (Environment de Dokploy)
+      - traefik.http.middlewares.shlink-app-auth.basicauth.users=${APP_BASIC_AUTH}
+      - traefik.http.routers.shlink-app-http.rule=Host(`app.shortdi.link`)
+      - traefik.http.routers.shlink-app-http.entrypoints=web
+      - traefik.http.routers.shlink-app-http.middlewares=redirect-to-https@file
+      - traefik.http.routers.shlink-app.rule=Host(`app.shortdi.link`)
+      - traefik.http.routers.shlink-app.entrypoints=websecure
+      - traefik.http.routers.shlink-app.tls.certresolver=letsencrypt
+      - traefik.http.routers.shlink-app.middlewares=shlink-app-auth
+      - traefik.http.services.shlink-app.loadbalancer.server.port=8080
+
+  # Postgres propio: la herramienta queda autocontenida (migrar = este repo
+  # + dump de esta base). Sin puertos publicados (ver SECURITY.md).
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shlink
+      POSTGRES_USER: shlink
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shlink -d shlink"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  db-data:
+  shlink-data:
